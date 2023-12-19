@@ -17,6 +17,7 @@ from tqdm.auto import tqdm
 
 from marigold import MarigoldPipeline
 from marigold.util.seed_all import seed_all
+from marigold.util.ply_util import save_colored_point_cloud
 
 
 EXTENSION_LIST = [".jpg", ".jpeg", ".png"]
@@ -127,10 +128,12 @@ if "__main__" == __name__:
     output_dir_color = os.path.join(output_dir, "depth_colored")
     output_dir_tif = os.path.join(output_dir, "depth_bw")
     output_dir_npy = os.path.join(output_dir, "depth_npy")
+    output_dir_ply = os.path.join(output_dir, "point_cloud")
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(output_dir_color, exist_ok=True)
     os.makedirs(output_dir_tif, exist_ok=True)
     os.makedirs(output_dir_npy, exist_ok=True)
+    os.makedirs(output_dir_ply, exist_ok=True)
     logging.info(f"output dir: {output_dir}")
 
     # Device
@@ -162,9 +165,14 @@ if "__main__" == __name__:
         exit(1)
 
     # -------------------- Model --------------------
-    pipe = MarigoldPipeline.from_pretrained(checkpoint_path)
+    pipe = MarigoldPipeline.from_pretrained(
+        checkpoint_path,
+        resume_download=True,
+        mirror="https://mirrors.aliyun.com/huggingface/",
+    )
     try:
         import xformers
+
         pipe.enable_xformers_memory_efficient_attention()
     except:
         pass  # run without xformers
@@ -214,5 +222,15 @@ if "__main__" == __name__:
                 output_dir_color, f"{pred_name_base}_colored.png"
             )
             if os.path.exists(colored_save_path):
-                logging.warning(f"Existing file: '{colored_save_path}' will be overwritten")
+                logging.warning(
+                    f"Existing file: '{colored_save_path}' will be overwritten"
+                )
             depth_colored.save(colored_save_path)
+
+            # colored depth
+            ply_save_path = os.path.join(
+                output_dir_ply, f"{pred_name_base}_colored.ply"
+            )
+            if os.path.exists(ply_save_path):
+                logging.warning(f"Existing file: '{ply_save_path}' will be overwritten")
+            save_colored_point_cloud(depth_pred, np.array(input_image), ply_save_path)
