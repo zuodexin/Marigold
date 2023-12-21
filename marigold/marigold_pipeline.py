@@ -1,5 +1,22 @@
-# Author: Bingxin Ke
-# Last modified: 2023-12-15
+# Copyright 2023 Bingxin Ke, ETH Zurich. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# --------------------------------------------------------------------------
+# If you find this code useful, we kindly ask you to cite our paper in your work.
+# Please find bibtex at: https://github.com/prs-eth/Marigold#-citation
+# More information about the method can be found at https://marigoldmonodepth.github.io
+# --------------------------------------------------------------------------
+
 
 from typing import List, Dict, Union
 
@@ -157,7 +174,7 @@ class MarigoldPipeline(DiffusionPipeline):
         # Normalize rgb values
         rgb = np.transpose(image, (2, 0, 1))  # [H, W, rgb] -> [rgb, H, W]
         rgb_norm = rgb / 255.0
-        rgb_norm = torch.from_numpy(rgb_norm).float()
+        rgb_norm = torch.from_numpy(rgb_norm).to(self.dtype)
         rgb_norm = rgb_norm.to(device)
         assert rgb_norm.min() >= 0.0 and rgb_norm.max() <= 1.0
 
@@ -169,7 +186,9 @@ class MarigoldPipeline(DiffusionPipeline):
             _bs = batch_size
         else:
             _bs = find_batch_size(
-                ensemble_size=ensemble_size, input_res=max(rgb_norm.shape[1:])
+                ensemble_size=ensemble_size,
+                input_res=max(rgb_norm.shape[1:]),
+                dtype=self.dtype,
             )
 
         single_rgb_loader = DataLoader(
@@ -211,7 +230,7 @@ class MarigoldPipeline(DiffusionPipeline):
         depth_pred = (depth_pred - min_d) / (max_d - min_d)
 
         # Convert to numpy
-        depth_pred = depth_pred.cpu().numpy()
+        depth_pred = depth_pred.cpu().numpy().astype(np.float32)
 
         # Resize back to original resolution
         if match_input_res:
@@ -248,7 +267,7 @@ class MarigoldPipeline(DiffusionPipeline):
             return_tensors="pt",
         )
         text_input_ids = text_inputs.input_ids.to(self.text_encoder.device)
-        self.empty_text_embed = self.text_encoder(text_input_ids)[0]
+        self.empty_text_embed = self.text_encoder(text_input_ids)[0].to(self.dtype)
 
     @torch.no_grad()
     def single_infer(
@@ -261,7 +280,7 @@ class MarigoldPipeline(DiffusionPipeline):
             rgb_in (torch.Tensor):
                 Input RGB image.
             num_inference_steps (int):
-                Number of diffusion denoisign steps (DDIM) during inference.
+                Number of diffusion denoising steps (DDIM) during inference.
             show_pbar (bool):
                 Display a progress bar of diffusion denoising.
 
@@ -278,7 +297,9 @@ class MarigoldPipeline(DiffusionPipeline):
         rgb_latent = self.encode_rgb(rgb_in)
 
         # Initial depth map (noise)
-        depth_latent = torch.randn(rgb_latent.shape, device=device)  # [B, 4, h, w]
+        depth_latent = torch.randn(
+            rgb_latent.shape, device=device, dtype=self.dtype
+        )  # [B, 4, h, w]
 
         # Batched empty text embedding
         if self.empty_text_embed is None:
@@ -310,12 +331,13 @@ class MarigoldPipeline(DiffusionPipeline):
 
             # compute the previous noisy sample x_t -> x_t-1
             depth_latent = self.scheduler.step(noise_pred, t, depth_latent).prev_sample
+        torch.cuda.empty_cache()
         depth = self.decode_depth(depth_latent)
 
         # clip prediction
         depth = torch.clip(depth, -1.0, 1.0)
         # shift to [0, 1]
-        depth = depth * 2.0 - 1.0
+        depth = (depth + 1.0) / 2.0
 
         return depth
 
