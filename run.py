@@ -19,20 +19,16 @@
 
 
 import argparse
+import logging
 import os
 from glob import glob
-import logging
 
 import numpy as np
 import torch
 from PIL import Image
 from tqdm.auto import tqdm
 
-
 from marigold import MarigoldPipeline
-from marigold.util.seed_all import seed_all
-from marigold.util.ply_util import save_colored_point_cloud
-
 
 EXTENSION_LIST = [".jpg", ".jpeg", ".png"]
 
@@ -47,7 +43,7 @@ if "__main__" == __name__:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="Bingxin/Marigold",
+        default="prs-eth/marigold-lcm-v1-0",
         help="Checkpoint path or hub name.",
     )
 
@@ -66,17 +62,18 @@ if "__main__" == __name__:
     parser.add_argument(
         "--denoise_steps",
         type=int,
-        default=10,
-        help="Diffusion denoising steps, more stepts results in higher accuracy but slower inference speed.",
+        default=None,
+        help="Diffusion denoising steps, more steps results in higher accuracy but slower inference speed. For the original (DDIM) version, it's recommended to use 10-50 steps, while for LCM 1-4 steps.",
     )
     parser.add_argument(
         "--ensemble_size",
         type=int,
-        default=10,
+        default=5,
         help="Number of predictions to be ensembled, more inference gives better results but runs slower.",
     )
     parser.add_argument(
         "--half_precision",
+        "--fp16",
         action="store_true",
         help="Run with half-precision (16-bit float), might lead to suboptimal result.",
     )
@@ -85,13 +82,19 @@ if "__main__" == __name__:
     parser.add_argument(
         "--processing_res",
         type=int,
-        default=768,
+        default=None,
         help="Maximum resolution of processing. 0 for using input image resolution. Default: 768.",
     )
     parser.add_argument(
         "--output_processing_res",
         action="store_true",
         help="When input is resized, out put depth at resized operating resolution. Default: False.",
+    )
+    parser.add_argument(
+        "--resample_method",
+        choices=["bilinear", "bicubic", "nearest"],
+        default="bilinear",
+        help="Resampling method used to resize images and depth predictions. This can be one of `bilinear`, `bicubic` or `nearest`. Default: `bilinear`",
     )
 
     # depth map colormap
@@ -103,7 +106,13 @@ if "__main__" == __name__:
     )
 
     # other settings
-    parser.add_argument("--seed", type=int, default=None, help="Random seed.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Reproducibility seed. Set to `None` for unseeded inference.",
+    )
+
     parser.add_argument(
         "--batch_size",
         type=int,
@@ -125,11 +134,16 @@ if "__main__" == __name__:
     denoise_steps = args.denoise_steps
     ensemble_size = args.ensemble_size
     if ensemble_size > 15:
-        logging.warning(f"Running with large ensemble size will be slow.")
+        logging.warning("Running with large ensemble size will be slow.")
     half_precision = args.half_precision
 
     processing_res = args.processing_res
     match_input_res = not args.output_processing_res
+    if 0 == processing_res and match_input_res is False:
+        logging.warning(
+            "Processing at native resolution without resizing output might NOT lead to exactly the same resolution, due to the padding and pooling properties of conv layers."
+        )
+    resample_method = args.resample_method
 
     color_map = args.color_map
     seed = args.seed
@@ -139,13 +153,6 @@ if "__main__" == __name__:
         batch_size = 1  # set default batchsize
 
     # -------------------- Preparation --------------------
-    # Random seed
-    if seed is None:
-        import time
-
-        seed = int(time.time())
-    seed_all(seed)
-
     # Output directories
     output_dir_color = os.path.join(output_dir, "depth_colored")
     output_dir_tif = os.path.join(output_dir, "depth_bw")
@@ -189,9 +196,17 @@ if "__main__" == __name__:
     # -------------------- Model --------------------
     if half_precision:
         dtype = torch.float16
-        logging.info(f"Running with half precision ({dtype}).")
+        variant = "fp16"
+        logging.info(
+            f"Running with half precision ({dtype}), might lead to suboptimal result."
+        )
     else:
         dtype = torch.float32
+        variant = None
+
+    pipe: MarigoldPipeline = MarigoldPipeline.from_pretrained(
+        checkpoint_path, variant=variant, torch_dtype=dtype
+    )
 
     pipe = MarigoldPipeline.from_pretrained(
         checkpoint_path,
@@ -204,18 +219,38 @@ if "__main__" == __name__:
         import xformers
 
         pipe.enable_xformers_memory_efficient_attention()
-    except:
+    except ImportError:
         pass  # run without xformers
 
     pipe = pipe.to(device)
+    logging.info(
+        f"scale_invariant: {pipe.scale_invariant}, shift_invariant: {pipe.shift_invariant}"
+    )
+
+    # Print out config
+    logging.info(
+        f"Inference settings: checkpoint = `{checkpoint_path}`, "
+        f"with denoise_steps = {denoise_steps or pipe.default_denoising_steps}, "
+        f"ensemble_size = {ensemble_size}, "
+        f"processing resolution = {processing_res or pipe.default_processing_resolution}, "
+        f"seed = {seed}; "
+        f"color_map = {color_map}."
+    )
 
     # -------------------- Inference and saving --------------------
     with torch.no_grad():
         os.makedirs(output_dir, exist_ok=True)
 
-        for rgb_path in tqdm(rgb_filename_list, desc=f"Estimating depth", leave=True):
+        for rgb_path in tqdm(rgb_filename_list, desc="Estimating depth", leave=True):
             # Read input image
             input_image = Image.open(rgb_path)
+
+            # Random number generator
+            if seed is None:
+                generator = None
+            else:
+                generator = torch.Generator(device=device)
+                generator.manual_seed(seed)
 
             # Predict depth
             pipe_out = pipe(
@@ -227,6 +262,8 @@ if "__main__" == __name__:
                 batch_size=batch_size,
                 color_map=color_map,
                 show_progress_bar=True,
+                resample_method=resample_method,
+                generator=generator,
             )
 
             depth_pred: np.ndarray = pipe_out.depth_np
